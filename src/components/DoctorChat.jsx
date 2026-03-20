@@ -23,9 +23,60 @@ export default function DoctorChat({ onSwitchToResearch }) {
     inputRef.current?.focus();
   }, []);
 
+  // Detect if user wants to search for research papers
+  const detectResearchIntent = (text) => {
+    const lower = text.toLowerCase();
+    const patterns = [
+      /find\s+(research\s+)?papers?\s+(on|about|for|regarding)/,
+      /search\s+(for\s+)?(research\s+)?papers?\s*(on|about|for|regarding)?/,
+      /can you find\s+(research|papers?|studies)/,
+      /look\s+(up|for)\s+(research|papers?|studies)/,
+      /get\s+me\s+(research|papers?|studies)/,
+      /show\s+me\s+(research|papers?|studies)/,
+      /fetch\s+(research|papers?|studies)/,
+      /research\s+papers?\s+(on|about|for|regarding)/,
+      /find\s+(me\s+)?(some\s+)?(studies|articles|literature)\s+(on|about)/,
+      /any\s+(research|papers?|studies)\s+(on|about)/,
+      /what\s+(does\s+the\s+)?research\s+say\s+(about|on)/,
+      /search\s+(the\s+)?literature\s+(on|about|for)/,
+    ];
+    return patterns.some((p) => p.test(lower));
+  };
+
+  // Extract the research topic from the message
+  const extractResearchTopic = (text) => {
+    const lower = text.toLowerCase();
+    // Remove common prefixes to get the topic
+    const cleaned = lower
+      .replace(/^(can you |please |could you |i want to |i need to |i'd like to )/i, '')
+      .replace(/^(find|search|look up|get me|show me|fetch|look for)\s+(me\s+)?(some\s+)?(research\s+)?(papers?|studies|articles|literature)\s+(on|about|for|regarding)\s+/i, '')
+      .replace(/^(any|what does the|what does)\s+(research\s+)?(papers?|studies)?\s*(say\s+)?(on|about)\s+/i, '')
+      .replace(/^(research\s+papers?\s+(on|about|for|regarding)\s+)/i, '')
+      .replace(/^(search\s+(the\s+)?literature\s+(on|about|for)\s+)/i, '')
+      .replace(/[?.!]+$/, '')
+      .trim();
+    return cleaned || text.trim();
+  };
+
   const sendMessage = async (text) => {
     if (!text.trim() || loading) return;
-    const userMsg = { role: 'user', content: text.trim() };
+    const trimmed = text.trim();
+
+    // Check for research intent — redirect to research section
+    if (detectResearchIntent(trimmed)) {
+      const topic = extractResearchTopic(trimmed);
+      // Show a brief message before redirecting
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', content: trimmed },
+        { role: 'assistant', content: `Redirecting you to the research section to search papers on "${topic}"...` },
+      ]);
+      setInput('');
+      setTimeout(() => onSwitchToResearch?.(topic), 800);
+      return;
+    }
+
+    const userMsg = { role: 'user', content: trimmed };
     const updated = [...messages, userMsg];
     setMessages(updated);
     setInput('');

@@ -15,10 +15,11 @@ function getNodeColor(year) {
   return '#94a3b8';
 }
 
-export default function ResearchGraph({ papers, relationships, summaries, onSelectPaper, selectedPaperId }) {
+export default function ResearchGraph({ papers, relationships, summaries, onSelectPaper, onOpenFullPaper, selectedPaperId }) {
   const svgRef = useRef(null);
   const simulationRef = useRef(null);
-  const [popup, setPopup] = useState(null);
+  const [previewPanel, setPreviewPanel] = useState(null);
+  const builtRef = useRef(false); // prevent re-building on selectedPaper change
 
   const buildGraph = useCallback(() => {
     if (!papers.length || !svgRef.current) return;
@@ -51,8 +52,6 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
     }));
 
     const nodeIds = new Set(nodes.map((n) => n.id));
-    console.log('[ResearchGraph] nodeIds:', [...nodeIds]);
-    console.log('[ResearchGraph] relationships:', relationships);
     const links = relationships
       .filter((r) => nodeIds.has(r.paper1_id) && nodeIds.has(r.paper2_id))
       .map((r) => ({
@@ -62,18 +61,14 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
         strength: r.strength || 0.5,
         reason: r.reason,
       }));
-    console.log('[ResearchGraph] filtered links:', links.length);
 
     const defs = svg.append('defs');
-
-    // Glow filter
     const glow = defs.append('filter').attr('id', 'node-glow').attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
     glow.append('feGaussianBlur').attr('stdDeviation', '6').attr('result', 'blur');
     const merge = glow.append('feMerge');
     merge.append('feMergeNode').attr('in', 'blur');
     merge.append('feMergeNode').attr('in', 'SourceGraphic');
 
-    // Selected glow
     const selGlow = defs.append('filter').attr('id', 'selected-glow').attr('x', '-80%').attr('y', '-80%').attr('width', '260%').attr('height', '260%');
     selGlow.append('feGaussianBlur').attr('stdDeviation', '10').attr('result', 'blur');
     const selMerge = selGlow.append('feMerge');
@@ -81,13 +76,12 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
     selMerge.append('feMergeNode').attr('in', 'SourceGraphic');
 
     const g = svg.append('g');
-
     const zoom = d3.zoom().scaleExtent([0.2, 5]).on('zoom', (event) => {
       g.attr('transform', event.transform);
     });
     svg.call(zoom);
 
-    // Links — rendered BEFORE nodes so they appear behind
+    // Links
     const link = g.append('g').attr('class', 'links').selectAll('line').data(links).join('line')
       .attr('stroke', (d) => RELATIONSHIP_COLORS[d.type] || '#64748b')
       .attr('stroke-opacity', (d) => 0.5 + d.strength * 0.4)
@@ -114,23 +108,14 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
         const paper = papers.find((p) => p.paperId === d.id);
         if (paper) {
           onSelectPaper(paper);
-          // Get position relative to the SVG container
-          const svgRect = svgRef.current.getBoundingClientRect();
-          const wrapRect = svgRef.current.parentElement.getBoundingClientRect();
-          const transform = d3.zoomTransform(svgRef.current);
-          const screenX = transform.applyX(d.x) + (svgRect.left - wrapRect.left);
-          const screenY = transform.applyY(d.y) + (svgRect.top - wrapRect.top);
-          setPopup({
+          setPreviewPanel({
             paper,
             summary: summaries?.[paper.paperId] || null,
-            x: Math.min(Math.max(screenX - 160, 10), width - 340),
-            y: Math.min(Math.max(screenY + d.radius + 15, 10), height - 300),
           });
         }
       });
 
-    // Close popup on background click
-    svg.on('click', () => setPopup(null));
+    svg.on('click', () => setPreviewPanel(null));
 
     // Contradiction ring
     node.filter((d) => d.hasContradiction)
@@ -142,20 +127,20 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
       .attr('stroke-dasharray', '5,4')
       .attr('opacity', 0.6);
 
-    // Outer glow circle
+    // Outer glow
     node.append('circle')
       .attr('r', (d) => d.radius + 4)
       .attr('fill', (d) => d.color)
       .attr('fill-opacity', 0.12)
-      .style('filter', (d) => d.id === selectedPaperId ? 'url(#selected-glow)' : 'url(#node-glow)');
+      .style('filter', 'url(#node-glow)');
 
     // Main circle
     node.append('circle')
       .attr('r', (d) => d.radius)
       .attr('fill', (d) => d.color)
       .attr('fill-opacity', 0.9)
-      .attr('stroke', (d) => d.id === selectedPaperId ? '#ffffff' : 'rgba(255,255,255,0.15)')
-      .attr('stroke-width', (d) => d.id === selectedPaperId ? 2.5 : 1);
+      .attr('stroke', 'rgba(255,255,255,0.15)')
+      .attr('stroke-width', 1);
 
     // Inner highlight
     node.append('circle')
@@ -163,14 +148,14 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
       .attr('fill', 'rgba(255,255,255,0.12)')
       .attr('pointer-events', 'none');
 
-    // Label below node
+    // Label
     node.append('text')
       .text((d) => d.title.length > 22 ? d.title.slice(0, 20) + '...' : d.title)
       .attr('dy', (d) => d.radius + 16)
       .attr('text-anchor', 'middle')
       .attr('fill', 'rgba(255,255,255,0.55)')
       .attr('font-size', '9px')
-      .attr('font-family', 'Inter, system-ui, sans-serif')
+      .attr('font-family', 'IBM Plex Sans, system-ui, sans-serif')
       .attr('pointer-events', 'none');
 
     // Year inside node
@@ -181,7 +166,7 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
       .attr('fill', 'rgba(255,255,255,0.85)')
       .attr('font-size', '10px')
       .attr('font-weight', '700')
-      .attr('font-family', 'Inter, system-ui, sans-serif')
+      .attr('font-family', 'IBM Plex Mono, monospace')
       .attr('pointer-events', 'none');
 
     node.append('title').text((d) => `${d.title}\n${d.year} · ${d.citations} citations`);
@@ -198,8 +183,10 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
         node.attr('transform', (d) => `translate(${d.x},${d.y})`);
       });
 
-    // Zoom to fit after simulation settles
     simulationRef.current.on('end', () => {
+      // Only zoom-to-fit once on initial graph build
+      if (builtRef.current) return;
+      builtRef.current = true;
       const allX = nodes.map((n) => n.x);
       const allY = nodes.map((n) => n.y);
       const pad = 80;
@@ -218,66 +205,84 @@ export default function ResearchGraph({ papers, relationships, summaries, onSele
         .translate(-centerX, -centerY);
       svg.transition().duration(800).call(zoom.transform, transform);
     });
-  }, [papers, relationships, summaries, selectedPaperId, onSelectPaper]);
+  }, [papers, relationships, summaries, onSelectPaper]);
 
   useEffect(() => {
-    setPopup(null);
+    // Only rebuild graph when papers/relationships change, not on selectedPaper change
+    setPreviewPanel(null);
+    builtRef.current = false;
     buildGraph();
     return () => { if (simulationRef.current) simulationRef.current.stop(); };
   }, [buildGraph]);
 
   return (
-    <div className="research-graph dark">
+    <div className="research-graph">
       <div className="graph-top-bar">
         <div className="graph-title">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" />
             <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" /><line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
           </svg>
-          <span>Knowledge Graph</span>
+          <span>KNOWLEDGE GRAPH</span>
         </div>
-        <div className="graph-legend dark">
+        <div className="graph-legend">
           <span className="legend-item"><span className="legend-dot" style={{ background: '#34d399' }} /> Recent</span>
           <span className="legend-item"><span className="legend-dot" style={{ background: '#60a5fa' }} /> 3-5yr</span>
           <span className="legend-item"><span className="legend-dot" style={{ background: '#94a3b8' }} /> Older</span>
           <span className="legend-item"><span className="legend-line dashed amber" /> Contradiction</span>
         </div>
       </div>
-      <div className="graph-canvas-wrap">
+      <div className={`graph-canvas-wrap ${previewPanel ? 'panel-open' : ''}`}>
         <svg ref={svgRef} />
-        {popup && (
-          <div
-            className="graph-popup"
-            style={{ left: popup.x, top: popup.y }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="popup-arrow" />
-            <button className="popup-close" onClick={() => setPopup(null)}>&times;</button>
-            <h4>{popup.paper.title}</h4>
-            <div className="popup-meta">
-              <span className="popup-chip">{popup.paper.year}</span>
-              <span className="popup-chip">{popup.paper.citationCount || 0} citations</span>
-              <span className="popup-authors">
-                {popup.paper.authors?.slice(0, 2).map((a) => a.name).join(', ')}
-                {popup.paper.authors?.length > 2 ? ' et al.' : ''}
-              </span>
+
+        {/* Slide-in preview panel */}
+        {previewPanel && (
+          <div className="graph-preview-panel">
+            <div className="preview-header">
+              <div className="preview-label">PAPER PREVIEW</div>
+              <button className="preview-close" onClick={() => setPreviewPanel(null)}>&times;</button>
             </div>
-            {popup.summary && (
-              <p className="popup-summary">
-                {popup.summary.slice(0, 300)}
-              </p>
-            )}
-            {!popup.summary && popup.paper.abstract && (
-              <p className="popup-abstract">{popup.paper.abstract.slice(0, 250)}...</p>
-            )}
-            <div className="popup-links">
-              {popup.paper.openAccessPdf?.url && (
-                <a href={popup.paper.openAccessPdf.url} target="_blank" rel="noopener noreferrer">View PDF</a>
-              )}
-              {popup.paper.url && (
-                <a href={popup.paper.url} target="_blank" rel="noopener noreferrer">Semantic Scholar</a>
+
+            <div className="preview-badges">
+              <span className="preview-badge year">{previewPanel.paper.year}</span>
+              <span className="preview-badge citations">{previewPanel.paper.citationCount || 0} citations</span>
+            </div>
+
+            <h4 className="preview-title">{previewPanel.paper.title}</h4>
+
+            <p className="preview-authors">
+              {previewPanel.paper.authors?.slice(0, 3).map((a) => a.name).join(', ')}
+              {previewPanel.paper.authors?.length > 3 ? ' et al.' : ''}
+            </p>
+
+            <hr className="preview-divider" />
+
+            <div>
+              <div className="preview-summary-label">AI SUMMARY</div>
+              {previewPanel.summary ? (
+                <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7, margin: 0 }}>
+                  {previewPanel.summary.replace(/[-•]\s*/g, '').slice(0, 250)}
+                  {previewPanel.summary.length > 250 ? '...' : ''}
+                </p>
+              ) : (
+                [1, 2, 3].map((i) => (
+                  <div key={i} className="preview-skeleton" style={{ width: i === 3 ? '60%' : '100%' }} />
+                ))
               )}
             </div>
+
+            <div style={{ flex: 1 }} />
+
+            <button
+              className="btn btn-primary preview-open-btn"
+              style={{ width: '100%', justifyContent: 'center', borderRadius: 8, padding: '10px 0', fontSize: 12, letterSpacing: 1 }}
+              onClick={() => {
+                onOpenFullPaper(previewPanel.paper);
+                setPreviewPanel(null);
+              }}
+            >
+              OPEN FULL PAPER &rarr;
+            </button>
           </div>
         )}
       </div>

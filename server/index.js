@@ -91,7 +91,7 @@ app.post('/api/search-papers', async (req, res) => {
   }
 });
 
-// Analyze paper relationships for the graph
+// Analyze paper relationships (Claude when available, Gemini fallback)
 app.post('/api/analyze-relationships', async (req, res) => {
   try {
     const { papers } = req.body;
@@ -99,26 +99,40 @@ app.post('/api/analyze-relationships', async (req, res) => {
       (p) => `ID: ${p.paperId} | Title: ${p.title} | Abstract: ${(p.abstract || '').slice(0, 200)}`
     );
     const validIds = papers.map((p) => p.paperId);
-    const json = await askGeminiJSON(
-      `Medical research analyst. Analyze these papers and identify relationships between them. Return a JSON object: {"relationships":[{"paper1_id":"id","paper2_id":"id","type":"shared_concept|contradiction|methodology","strength":0.8,"reason":"short reason"}]}.
+    let relationships;
 
-CRITICAL: You MUST use the EXACT paper IDs listed below — copy-paste them character for character. Do not abbreviate or modify them.
+    if (process.env.CLAUDE_API_KEY) {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.CLAUDE_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 2000,
+          system: `You are a medical research paper analyst. Return ONLY a valid JSON array:\n[{"paper1_id":"exact_id","paper2_id":"exact_id","type":"shared_concept|contradiction|methodology","strength":0.1-1.0,"reason":"under 80 chars"}]\nGenerate 8-15 relationships. Use EXACT IDs.`,
+          messages: [{ role: 'user', content: `Valid IDs: ${JSON.stringify(validIds)}\n\nPapers:\n${paperSummaries.join('\n')}` }],
+        }),
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message);
+      const text = data.content?.[0]?.text || '[]';
+      relationships = JSON.parse(text.replace(/```json|```/g, '').trim());
+    } else {
+      const json = await askGeminiJSON(
+        `Medical research analyst. Return JSON: {"relationships":[{"paper1_id":"id","paper2_id":"id","type":"shared_concept|contradiction|methodology","strength":0.8,"reason":"short reason"}]}.\nUse EXACT IDs: ${JSON.stringify(validIds)}\nPapers:\n${paperSummaries.join('\n')}`,
+        4096
+      );
+      relationships = json.relationships || json;
+    }
 
-Valid paper IDs: ${JSON.stringify(validIds)}
-
-Be medically accurate — only mark contradiction when findings genuinely conflict. Include at least 5-10 relationships if possible. Strength should be between 0.3 and 1.0.
-
-Papers:
-${paperSummaries.join('\n')}`,
-      4096
-    );
-    const relationships = json.relationships || json;
     console.log(`[analyze-relationships] Got ${relationships.length} relationships`);
-    // Filter to only valid IDs
     const filtered = relationships.filter(
       (r) => validIds.includes(r.paper1_id) && validIds.includes(r.paper2_id)
     );
-    console.log(`[analyze-relationships] After ID filtering: ${filtered.length} relationships`);
+    console.log(`[analyze-relationships] After filtering: ${filtered.length}`);
     res.json({ relationships: filtered });
   } catch (err) {
     console.error('analyze-relationships error:', err);
@@ -141,16 +155,40 @@ app.post('/api/summarize-papers', async (req, res) => {
   }
 });
 
-// Extract highlights from a paper
+// Extract highlights (Claude when available, Gemini fallback)
 app.post('/api/extract-highlights', async (req, res) => {
   try {
     const { paper } = req.body;
-    const json = await askGeminiJSON(
-      `Extract the 4-5 most clinically important highlights from this paper. Return JSON: {"highlights":[{"text":"highlight","importance":"critical|high|moderate","type":"finding|method|conclusion|limitation"}]}. Prioritize actionable clinical insights.\n\nTitle: ${paper.title}\nAbstract: ${paper.abstract || 'No abstract available'}`,
-      1024
-    );
-    const highlights = json.highlights || (Array.isArray(json) ? json : []);
-    res.json({ highlights });
+    let highlights;
+
+    if (process.env.CLAUDE_API_KEY) {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.CLAUDE_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1000,
+          system: `Extract 4-5 clinically important highlights. Return ONLY valid JSON array:\n[{"text":"finding max 30 words","importance":"critical|high|moderate","type":"finding|method|conclusion|limitation","passage":"verbatim substring from abstract"}]\nNEVER fabricate info not in the abstract.`,
+          messages: [{ role: 'user', content: `Title: ${paper.title}\nYear: ${paper.year}\nAbstract: ${paper.abstract || 'No abstract available'}` }],
+        }),
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message);
+      const text = data.content?.[0]?.text || '[]';
+      highlights = JSON.parse(text.replace(/```json|```/g, '').trim());
+    } else {
+      const json = await askGeminiJSON(
+        `Extract 4-5 clinically important highlights. Return JSON: {"highlights":[{"text":"highlight","importance":"critical|high|moderate","type":"finding|method|conclusion|limitation","passage":"verbatim sentence from abstract"}]}.\n\nTitle: ${paper.title}\nAbstract: ${paper.abstract || 'No abstract available'}`,
+        1024
+      );
+      highlights = json.highlights || (Array.isArray(json) ? json : []);
+    }
+
+    res.json({ highlights: Array.isArray(highlights) ? highlights : [] });
   } catch (err) {
     console.error('extract-highlights error:', err);
     res.status(500).json({ error: err.message });
