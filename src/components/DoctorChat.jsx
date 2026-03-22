@@ -1,44 +1,79 @@
 import { useState, useRef, useEffect } from 'react';
-import { doctorChat } from '../services/api';
+import { doctorChat, doctorChatWeb, extractResearchQuery, getFollowUpQuestions } from '../services/api';
 
 const SUGGESTIONS = [
-  { icon: '🔬', text: 'Search papers on GLP-1 agonists for obesity', research: true },
-  { icon: '💊', text: 'Find research comparing SSRIs vs SNRIs', research: true },
-  { icon: '🧬', text: 'Search studies on BRCA mutations and targeted therapy', research: true },
-  { icon: '🫀', text: 'Find papers on new heart failure management guidelines', research: true },
+  { text: 'Search papers on GLP-1 agonists for obesity', research: true },
+  { text: 'Find research comparing SSRIs vs SNRIs', research: true },
+  { text: 'Search studies on BRCA mutations and targeted therapy', research: true },
+  { text: 'Find papers on new heart failure management guidelines', research: true },
+];
+
+const LOADING_MESSAGES = [
+  'Scrubbing in... preparing your diagnosis',
+  'Checking the patient\'s chart...',
+  'Consulting the medical literature...',
+  'Running differential diagnosis...',
+  'Paging the attending physician...',
+  'Cross-referencing clinical guidelines...',
+  'Reviewing lab results...',
+  'Checking vital signs of the evidence...',
 ];
 
 export default function DoctorChat({ onSwitchToResearch }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [webSearch, setWebSearch] = useState(false);
+  const [loadingMsgIndex, setLoadingMsgIndex] = useState(0);
+  const [followUpQuestions, setFollowUpQuestions] = useState([]);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
+  // Auto-scroll when messages change or loading state changes
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    // Use setTimeout to ensure DOM has updated before scrolling
+    const timer = setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, 50);
+    return () => clearTimeout(timer);
+  }, [messages, loading, loadingMsgIndex]);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
+  // Rotate loading messages every 2 seconds while loading
+  useEffect(() => {
+    if (!loading) {
+      setLoadingMsgIndex(0);
+      return;
+    }
+    const interval = setInterval(() => {
+      setLoadingMsgIndex((prev) => (prev + 1) % LOADING_MESSAGES.length);
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [loading]);
+
   // Detect if user wants to search for research papers
   const detectResearchIntent = (text) => {
     const lower = text.toLowerCase();
     const patterns = [
-      /find\s+(research\s+)?papers?\s+(on|about|for|regarding)/,
+      /find\s+(research\s+)?papers?\s*(on|about|for|regarding)?/,
       /search\s+(for\s+)?(research\s+)?papers?\s*(on|about|for|regarding)?/,
       /can you find\s+(research|papers?|studies)/,
       /look\s+(up|for)\s+(research|papers?|studies)/,
       /get\s+me\s+(research|papers?|studies)/,
       /show\s+me\s+(research|papers?|studies)/,
       /fetch\s+(research|papers?|studies)/,
-      /research\s+papers?\s+(on|about|for|regarding)/,
-      /find\s+(me\s+)?(some\s+)?(studies|articles|literature)\s+(on|about)/,
+      /research\s+papers?\s*(on|about|for|regarding)?/,
+      /find\s+(me\s+)?(some\s+)?(studies|articles|literature)/,
       /any\s+(research|papers?|studies)\s+(on|about)/,
       /what\s+(does\s+the\s+)?research\s+say\s+(about|on)/,
       /search\s+(the\s+)?literature\s+(on|about|for)/,
+      /give\s+(me\s+)?(some\s+)?(research|papers?|studies|articles)/,
+      /i\s+(want|need)\s+(research|papers?|studies)/,
+      /papers?\s+(on|about|for|regarding)\s+/,
+      /pull\s+(up\s+)?(research|papers?|studies)/,
     ];
     return patterns.some((p) => p.test(lower));
   };
@@ -49,9 +84,11 @@ export default function DoctorChat({ onSwitchToResearch }) {
     // Remove common prefixes to get the topic
     const cleaned = lower
       .replace(/^(can you |please |could you |i want to |i need to |i'd like to )/i, '')
-      .replace(/^(find|search|look up|get me|show me|fetch|look for)\s+(me\s+)?(some\s+)?(research\s+)?(papers?|studies|articles|literature)\s+(on|about|for|regarding)\s+/i, '')
+      .replace(/^(find|search|look up|get me|show me|fetch|look for|give me|give|pull up)\s+(me\s+)?(some\s+)?(research\s+)?(papers?|studies|articles|literature)\s*(on|about|for|regarding)?\s*/i, '')
+      .replace(/^(i\s+(want|need)\s+)(research\s+)?(papers?|studies)\s*(on|about|for|regarding)?\s*/i, '')
       .replace(/^(any|what does the|what does)\s+(research\s+)?(papers?|studies)?\s*(say\s+)?(on|about)\s+/i, '')
-      .replace(/^(research\s+papers?\s+(on|about|for|regarding)\s+)/i, '')
+      .replace(/^(research\s+papers?\s*(on|about|for|regarding)\s*)/i, '')
+      .replace(/^(papers?\s+(on|about|for|regarding)\s+)/i, '')
       .replace(/^(search\s+(the\s+)?literature\s+(on|about|for)\s+)/i, '')
       .replace(/[?.!]+$/, '')
       .trim();
@@ -62,17 +99,34 @@ export default function DoctorChat({ onSwitchToResearch }) {
     if (!text.trim() || loading) return;
     const trimmed = text.trim();
 
-    // Check for research intent — redirect to research section
+    // Check for research intent — use conversation memory to extract query
     if (detectResearchIntent(trimmed)) {
-      const topic = extractResearchTopic(trimmed);
-      // Show a brief message before redirecting
-      setMessages((prev) => [
-        ...prev,
-        { role: 'user', content: trimmed },
-        { role: 'assistant', content: `Redirecting you to the research section to search papers on "${topic}"...` },
-      ]);
+      const allMessages = [...messages, { role: 'user', content: trimmed }];
+      setMessages(allMessages);
       setInput('');
-      setTimeout(() => onSwitchToResearch?.(topic), 800);
+      setLoading(true);
+      setFollowUpQuestions([]);
+
+      try {
+        // Use Gemini to extract a research query from the full conversation
+        const data = await extractResearchQuery(allMessages);
+        const query = data.query || extractResearchTopic(trimmed);
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: `Found it! Searching research papers for "${query}"...` },
+        ]);
+        setLoading(false);
+        setTimeout(() => onSwitchToResearch?.(query), 600);
+      } catch {
+        // Fallback to simple extraction
+        const fallback = extractResearchTopic(trimmed);
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: `Redirecting to research for "${fallback}"...` },
+        ]);
+        setLoading(false);
+        setTimeout(() => onSwitchToResearch?.(fallback), 600);
+      }
       return;
     }
 
@@ -83,8 +137,15 @@ export default function DoctorChat({ onSwitchToResearch }) {
     setLoading(true);
 
     try {
-      const data = await doctorChat(updated);
-      setMessages((prev) => [...prev, { role: 'assistant', content: data.reply }]);
+      const chatFn = webSearch ? doctorChatWeb : doctorChat;
+      const data = await chatFn(updated);
+      const newMessages = [...updated, { role: 'assistant', content: data.reply }];
+      setMessages(newMessages);
+      // Fetch follow-up questions in the background
+      setFollowUpQuestions([]);
+      getFollowUpQuestions(newMessages)
+        .then((fData) => setFollowUpQuestions(fData.questions || []))
+        .catch(() => setFollowUpQuestions([]));
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -108,20 +169,23 @@ export default function DoctorChat({ onSwitchToResearch }) {
   };
 
   const formatMessage = (text) => {
-    // Simple markdown-like formatting
-    return text.split('\n').map((line, i) => {
-      // Bold
-      line = line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    // Strip markdown formatting first
+    const cleaned = text
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/\*(.+?)\*/g, '$1')
+      .replace(/^#{1,4}\s+/gm, '');
+
+    return cleaned.split('\n').map((line, i) => {
       // Bullet points
       if (line.match(/^[-•]\s/)) {
-        return `<li key="${i}">${line.replace(/^[-•]\s/, '')}</li>`;
+        return <li key={i}>{line.replace(/^[-•]\s/, '')}</li>;
       }
       // Numbered lists
       if (line.match(/^\d+\.\s/)) {
-        return `<li key="${i}">${line.replace(/^\d+\.\s/, '')}</li>`;
+        return <li key={i}>{line.replace(/^\d+\.\s/, '')}</li>;
       }
-      return line;
-    }).join('\n');
+      return <span key={i}>{line}{'\n'}</span>;
+    });
   };
 
   return (
@@ -144,9 +208,8 @@ export default function DoctorChat({ onSwitchToResearch }) {
                 <button
                   key={i}
                   className="dc-suggestion-card"
-                  onClick={() => s.research ? onSwitchToResearch?.(s.text) : sendMessage(s.text)}
+                  onClick={() => s.research ? onSwitchToResearch?.(extractResearchTopic(s.text)) : sendMessage(s.text)}
                 >
-                  <span className="dc-suggestion-icon">{s.icon}</span>
                   <span className="dc-suggestion-text">{s.text}</span>
                 </button>
               ))}
@@ -164,10 +227,9 @@ export default function DoctorChat({ onSwitchToResearch }) {
                   </div>
                 )}
                 <div className="dc-msg-content">
-                  <div
-                    className="dc-msg-text"
-                    dangerouslySetInnerHTML={{ __html: formatMessage(msg.content) }}
-                  />
+                  <div className="dc-msg-text" style={{ whiteSpace: 'pre-wrap' }}>
+                    {formatMessage(msg.content)}
+                  </div>
                 </div>
               </div>
             ))}
@@ -180,15 +242,36 @@ export default function DoctorChat({ onSwitchToResearch }) {
                   </svg>
                 </div>
                 <div className="dc-msg-content">
-                  <div className="dc-typing">
-                    <span /><span /><span />
+                  <div className="dc-loading-message">
+                    <svg className="dc-loading-spinner" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                      <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                    </svg>
+                    <span className="dc-loading-text">{LOADING_MESSAGES[loadingMsgIndex]}</span>
                   </div>
                 </div>
               </div>
             )}
-            <div ref={messagesEndRef} />
+
+            {/* Smart Follow-up Questions */}
+            {!loading && followUpQuestions.length > 0 && (
+              <div className="dc-followup-questions">
+                <div className="dc-followup-label">Follow-up questions</div>
+                <div className="dc-followup-list">
+                  {followUpQuestions.map((q, i) => (
+                    <button
+                      key={i}
+                      className="dc-followup-btn"
+                      onClick={() => { setFollowUpQuestions([]); sendMessage(q); }}
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
+        <div ref={messagesEndRef} />
       </div>
 
       {/* Input bar */}
@@ -206,6 +289,19 @@ export default function DoctorChat({ onSwitchToResearch }) {
               className="dc-textarea"
             />
             <div className="dc-input-actions">
+              <button
+                type="button"
+                className={`dc-web-search-btn${webSearch ? ' active' : ''}`}
+                onClick={() => setWebSearch((prev) => !prev)}
+                title={webSearch ? 'Web search enabled' : 'Enable web search'}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="2" y1="12" x2="22" y2="12" />
+                  <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+                </svg>
+                <span>Web</span>
+              </button>
               <button
                 type="button"
                 className="dc-research-btn"

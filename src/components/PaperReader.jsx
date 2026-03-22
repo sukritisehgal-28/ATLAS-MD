@@ -1,9 +1,12 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import PaperDNA from './PaperDNA';
 
 const importanceColor = { critical: '#f87171', high: '#f59e0b', moderate: '#2563eb' };
 const importanceBg = { critical: '#1c0a0a', high: '#1c1004', moderate: '#0f1e35' };
 const typeIcon = { finding: '◈', method: '⊕', conclusion: '✓', limitation: '⚠' };
 const typeLabel = { finding: 'Key Finding', method: 'Methodology', conclusion: 'Conclusion', limitation: 'Limitation' };
+
+const CURRENT_YEAR = new Date().getFullYear();
 
 function buildAnnotatedSections(abstract, highlights) {
   if (!abstract || !highlights?.length) {
@@ -43,11 +46,46 @@ function buildAnnotatedSections(abstract, highlights) {
   return sections;
 }
 
-export default function PaperReader({ paper, highlights, highlightsLoading, rankedPapers, onSelectPaper }) {
+function useAnnotationObserver() {
+  const observerRef = useRef(null);
+  const cardRefs = useRef([]);
+
+  const setCardRef = useCallback((index, el) => {
+    cardRefs.current[index] = el;
+  }, []);
+
+  useEffect(() => {
+    observerRef.current = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('annotation-visible');
+            observerRef.current?.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.2 }
+    );
+
+    const currentCards = cardRefs.current;
+    currentCards.forEach((el) => {
+      if (el) observerRef.current.observe(el);
+    });
+
+    return () => {
+      observerRef.current?.disconnect();
+    };
+  }, []);
+
+  return { setCardRef };
+}
+
+export default function PaperReader({ paper, highlights, highlightsLoading, rankedPapers, onSelectPaper, onSearchNewer, isBookmarked, onToggleBookmark, evidence }) {
   const [speakingIndex, setSpeakingIndex] = useState(null);
   const [isSpeakingAll, setIsSpeakingAll] = useState(false);
   const [showSaveMenu, setShowSaveMenu] = useState(false);
   const saveMenuRef = useRef(null);
+  const { setCardRef } = useAnnotationObserver();
 
   // Close save menu on outside click
   useEffect(() => {
@@ -183,8 +221,89 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
 
   const sections = buildAnnotatedSections(paper.abstract, highlights);
 
+  const paperAge = paper.year ? CURRENT_YEAR - paper.year : null;
+  const showAgeBanner = paperAge !== null && paperAge >= 6;
+
   return (
     <div className="paper-reader">
+      {/* Scoped styles for annotation animations and card textures */}
+      <style>{`
+        .annotation-card-animated {
+          opacity: 0;
+          transform: translateX(-30px);
+          transition: opacity 0.5s ease-out, transform 0.5s ease-out;
+          background-image:
+            repeating-linear-gradient(
+              0deg,
+              transparent,
+              transparent 2px,
+              rgba(255,255,255,0.008) 2px,
+              rgba(255,255,255,0.008) 4px
+            ),
+            repeating-linear-gradient(
+              90deg,
+              transparent,
+              transparent 2px,
+              rgba(255,255,255,0.005) 2px,
+              rgba(255,255,255,0.005) 4px
+            );
+        }
+        .annotation-card-animated.annotation-visible {
+          opacity: 1;
+          transform: translateX(0);
+        }
+        .annotation-card-pointer {
+          position: relative;
+        }
+        .annotation-card-pointer::before {
+          content: '';
+          position: absolute;
+          top: 14px;
+          left: -8px;
+          width: 0;
+          height: 0;
+          border-top: 6px solid transparent;
+          border-bottom: 6px solid transparent;
+          border-right: 8px solid var(--pointer-color, #2563eb35);
+        }
+        .age-banner {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 10px 14px;
+          margin-bottom: 16px;
+          border-radius: 6px;
+          background: rgba(245, 158, 11, 0.08);
+          border: 1px solid rgba(245, 158, 11, 0.25);
+          font-size: 12px;
+          color: #f59e0b;
+          font-family: var(--font-mono, monospace);
+        }
+        .age-banner-text {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex: 1;
+          min-width: 0;
+        }
+        .age-banner-btn {
+          background: rgba(245, 158, 11, 0.15);
+          border: 1px solid rgba(245, 158, 11, 0.35);
+          color: #f59e0b;
+          padding: 4px 10px;
+          border-radius: 4px;
+          font-size: 11px;
+          cursor: pointer;
+          white-space: nowrap;
+          font-family: var(--font-mono, monospace);
+          transition: background 0.15s;
+        }
+        .age-banner-btn:hover {
+          background: rgba(245, 158, 11, 0.25);
+        }
+      `}</style>
+
       <div className="reader-content">
         {/* Header */}
         <div className="reader-header">
@@ -210,6 +329,9 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
           <hr />
 
           <div className="reader-meta-row">
+            <PaperDNA paper={paper} evidence={evidence?.[paper.paperId]} size="large" />
+          </div>
+          <div className="reader-meta-row">
             {paper.authors?.slice(0, 3).map((a) => a.name).join(', ')}
             {paper.authors?.length > 3 ? ' et al.' : ''}
             <span> · {paper.year}</span>
@@ -230,11 +352,23 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
                 ↗ Source
               </a>
             )}
+            {/* Bookmark button */}
+            <button
+              className="btn btn-sm"
+              onClick={() => onToggleBookmark?.(paper)}
+              title={isBookmarked?.(paper.paperId) ? 'Remove bookmark' : 'Bookmark paper'}
+              style={{ color: isBookmarked?.(paper.paperId) ? '#f59e0b' : undefined }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill={isBookmarked?.(paper.paperId) ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2">
+                <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+              </svg>
+              {isBookmarked?.(paper.paperId) ? 'Saved' : 'Save'}
+            </button>
             {/* Save dropdown */}
             <div style={{ position: 'relative' }} ref={saveMenuRef}>
               <button className="btn btn-sm btn-green" onClick={() => setShowSaveMenu(!showSaveMenu)}>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>
-                Save
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+                Export
               </button>
               {showSaveMenu && (
                 <div className="save-dropdown">
@@ -257,6 +391,24 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
             </div>
           </div>
         </div>
+
+        {/* "What changed since" age banner */}
+        {showAgeBanner && (
+          <div className="age-banner">
+            <div className="age-banner-text">
+              <span>◈</span>
+              <span>This paper is {paperAge} years old. Research may have evolved.</span>
+            </div>
+            {onSearchNewer && (
+              <button
+                className="age-banner-btn"
+                onClick={() => onSearchNewer(paper.title)}
+              >
+                Find newer papers →
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Annotated content */}
         {highlightsLoading ? (
@@ -289,11 +441,13 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
                       style={{ background: importanceColor[section.highlight.importance] }}
                     />
                     <div
-                      className="annotation-card"
+                      ref={(el) => setCardRef(i, el)}
+                      className="annotation-card annotation-card-animated annotation-card-pointer"
                       style={{
                         border: `1px solid ${importanceColor[section.highlight.importance]}35`,
                         borderLeft: `3px solid ${importanceColor[section.highlight.importance]}`,
                         background: importanceBg[section.highlight.importance],
+                        '--pointer-color': `${importanceColor[section.highlight.importance]}35`,
                       }}
                     >
                       <div className="annotation-badge-row">
