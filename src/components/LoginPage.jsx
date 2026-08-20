@@ -132,6 +132,39 @@ export default function LoginPage({ onAuth }) {
               </>
             )}
           </div>
+
+          <div className="login-divider">
+            <span>or try instantly</span>
+          </div>
+
+          <div className="login-demo-buttons">
+            {[
+              { email: 'demo@atlasmd.live', password: 'demo1234', label: 'Demo User', icon: '👤' },
+            ].map((demo) => (
+              <button
+                key={demo.email}
+                className="login-demo-btn"
+                disabled={loading}
+                onClick={async () => {
+                  setError('');
+                  setLoading(true);
+                  try {
+                    const data = await login(demo.email, demo.password);
+                    if (!data.token || !data.user) throw new Error('Login failed');
+                    localStorage.setItem('atlas-token', data.token);
+                    onAuth(data.user);
+                  } catch (err) {
+                    setError(err.message);
+                  } finally {
+                    setLoading(false);
+                  }
+                }}
+              >
+                <span className="login-demo-icon">{demo.icon}</span>
+                <span className="login-demo-label">{demo.label}</span>
+              </button>
+            ))}
+          </div>
         </div>
 
         <p className="login-footer">AI-powered clinical research analysis</p>

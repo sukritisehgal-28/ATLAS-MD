@@ -18,7 +18,23 @@
       "Bash(node -e \"const pkg = require\\(''./node_modules/socket.io-client/package.json''\\); console.log\\(''client:'', pkg.version\\);\")",
       "Bash(npm run:*)",
       "Bash(node server/index.js)",
-      "Read(//var/folders/81/41q40fp56j1f28g097q81vyw0000gn/T/TemporaryItems/NSIRD_screencaptureui_kZBMVS/**)"
+      "Read(//var/folders/81/41q40fp56j1f28g097q81vyw0000gn/T/TemporaryItems/NSIRD_screencaptureui_kZBMVS/**)",
+      "Bash(npm ls:*)",
+      "Bash(npm test:*)",
+      "Bash(npx vitest:*)",
+      "Bash(gcloud --version)",
+      "Bash(gcloud auth:*)",
+      "Bash(gcloud config:*)",
+      "Bash(gcloud services:*)",
+      "Bash(gcloud artifacts:*)",
+      "Bash(docker build:*)",
+      "Bash(gcloud builds:*)",
+      "Bash(gcloud compute:*)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\" http://104.198.32.149:3001/)",
+      "Bash(curl -s --max-time 10 -o /dev/null -w \"HTTP %{http_code}\" http://104.198.32.149:3001/)",
+      "Bash(curl -s --max-time 10 -o /dev/null -w \"HTTP %{http_code}\" http://35.202.205.221:3001/)",
+      "Bash(curl -s --max-time 10 -o /dev/null -w \"HTTP %{http_code}\" http://atlasmd.live:3001/)",
+      "Bash(curl -s --max-time 10 -o /dev/null -w \"HTTP %{http_code}\" http://atlasmd.live/)"
     ]
   }
 }

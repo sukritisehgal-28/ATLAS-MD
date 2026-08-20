@@ -67,6 +67,16 @@ function loadTheme() {
   return localStorage.getItem('atlas-theme') || 'dark';
 }
 
+// The clinical brief is model-generated text summarising third-party abstracts,
+// so it is untrusted input. Escape it before the markdown-ish formatting below
+// turns it into HTML.
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -161,6 +171,7 @@ function AuthenticatedApp({ user, onLogout, theme, onToggleTheme }) {
   const [citationChainLoading, setCitationChainLoading] = useState(false);
   const [agentMessages, setAgentMessages] = useState([]);
   const [agentOpen, setAgentOpen] = useState(false);
+  const [doctorMessages, setDoctorMessages] = useState([]);
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
 
@@ -206,8 +217,9 @@ function AuthenticatedApp({ user, onLogout, theme, onToggleTheme }) {
       trialsLoading,
       agentMessages,
       agentOpen,
+      doctorMessages,
     });
-  }, [view, activeTabId, tabs, session, showReadingList, readingList, readingListLoading, showBrief, briefContent, briefLoading, showComparison, comparisonData, comparisonLoading, showTrials, trialsData, trialsMessage, trialsLoading, agentMessages, agentOpen]);
+  }, [view, activeTabId, tabs, session, showReadingList, readingList, readingListLoading, showBrief, briefContent, briefLoading, showComparison, comparisonData, comparisonLoading, showTrials, trialsData, trialsMessage, trialsLoading, agentMessages, agentOpen, doctorMessages]);
 
   const updateTab = useCallback((tabId, updates) => {
     setTabs((prev) =>
@@ -591,6 +603,7 @@ function AuthenticatedApp({ user, onLogout, theme, onToggleTheme }) {
   const renderTrialsLoading = showMirror ? snap.trialsLoading : trialsLoading;
   const renderAgentMessages = showMirror ? snap.agentMessages : agentMessages;
   const renderAgentOpen = showMirror ? snap.agentOpen : agentOpen;
+  const renderDoctorMessages = showMirror ? (snap.doctorMessages || []) : doctorMessages;
 
   // Draggable session bar state
   const [pressDrag, setPressDrag] = useState(null);
@@ -806,7 +819,11 @@ function AuthenticatedApp({ user, onLogout, theme, onToggleTheme }) {
 
         {/* Doctor Chat */}
         {renderView === 'chat' && (
-          <DoctorChat onSwitchToResearch={(q) => { if (q) handleNewSearch(q, { fromChat: true }); else setView('landing'); }} />
+          <DoctorChat
+            onSwitchToResearch={(q) => { if (q) handleNewSearch(q, { fromChat: true }); else setView('landing'); }}
+            doctorMessages={renderDoctorMessages}
+            onDoctorMessagesChange={showMirror ? undefined : setDoctorMessages}
+          />
         )}
 
         {/* Research View */}
@@ -961,6 +978,7 @@ function AuthenticatedApp({ user, onLogout, theme, onToggleTheme }) {
                   highlights={renderActiveTab.selectedPaper ? (renderActiveTab.highlights[renderActiveTab.selectedPaper?.paperId] || []) : []}
                   onQuestion={trackQuestion}
                   onNewTab={handleNewSearch}
+                  onSwitchToChat={() => setView('chat')}
                   sessionNotes={sessionNotes}
                   onAddNote={handleAddNote}
                   allPapers={renderActiveTab.papers}
@@ -1208,7 +1226,14 @@ function AuthenticatedApp({ user, onLogout, theme, onToggleTheme }) {
                 </div>
               ) : (
                 <div className="brief-content" dangerouslySetInnerHTML={{
-                  __html: (renderBriefContent || '').replace(/## (.*)/g, '<h3>$1</h3>').replace(/\n/g, '<br/>')
+                  __html: escapeHtml(renderBriefContent || '')
+                    .replace(/^### (.*)/gm, '<h4>$1</h4>')
+                    .replace(/^## (.*)/gm, '<h3>$1</h3>')
+                    .replace(/^# (.*)/gm, '<h3>$1</h3>')
+                    .replace(/\*\*(.+?)\*\*:?/g, '<strong>$1</strong>')
+                    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+                    .replace(/^[-•]\s+/gm, '&bull; ')
+                    .replace(/\n/g, '<br/>')
                 }} />
               )}
             </div>
@@ -1612,6 +1637,30 @@ function AuthenticatedApp({ user, onLogout, theme, onToggleTheme }) {
                 </>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Session ended popup */}
+      {session.sessionEnded && (
+        <div className="modal-overlay">
+          <div className="modal-panel" style={{ maxWidth: 400, textAlign: 'center', padding: '32px 24px' }} onClick={(e) => e.stopPropagation()}>
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="1.5" style={{ marginBottom: 16 }}>
+              <circle cx="12" cy="12" r="10" />
+              <line x1="15" y1="9" x2="9" y2="15" />
+              <line x1="9" y1="9" x2="15" y2="15" />
+            </svg>
+            <h3 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 8 }}>Session Ended</h3>
+            <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 20, lineHeight: 1.5 }}>
+              The host has left the session. You can continue your own research independently.
+            </p>
+            <button
+              className="btn btn-primary"
+              onClick={() => session.dismissSessionEnded()}
+              style={{ padding: '8px 24px', fontSize: 13 }}
+            >
+              OK
+            </button>
           </div>
         </div>
       )}

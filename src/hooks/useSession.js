@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
 
 let globalSocket = null;
+const SOCKET_URL = import.meta.env.VITE_API_URL || (import.meta.env.PROD ? window.location.origin : 'http://localhost:3001');
 
 function createSocket() {
   if (globalSocket) {
@@ -9,7 +10,7 @@ function createSocket() {
     globalSocket.disconnect();
   }
   const token = localStorage.getItem('atlas-token');
-  globalSocket = io('http://localhost:3001', {
+  globalSocket = io(SOCKET_URL, {
     auth: { token },
     autoConnect: false,
     reconnection: true,
@@ -36,6 +37,7 @@ export function useSession(user) {
   const [notifications, setNotifications] = useState([]);
   const [chatMessages, setChatMessages] = useState([]);
   const [joinRequests, setJoinRequests] = useState([]);
+  const [sessionEnded, setSessionEnded] = useState(false);
   const lastSnapshotRef = useRef('');
   const throttleRef = useRef(null);
 
@@ -104,6 +106,11 @@ export function useSession(user) {
       setChatMessages((prev) => [...prev, msg]);
     });
 
+    socket.on('session-ended', ({ hostName: hn }) => {
+      addNotification(`${hn || 'Host'} ended the session`);
+      setSessionEnded(true);
+    });
+
     socket.on('error', (msg) => {
       addNotification(`Error: ${msg}`);
     });
@@ -134,7 +141,13 @@ export function useSession(user) {
     setHostSnapshot(null);
     setIsHost(false);
     setJoinRequests([]);
+    setSessionEnded(false);
   }, []);
+
+  const dismissSessionEnded = useCallback(() => {
+    setSessionEnded(false);
+    leaveRoom();
+  }, [leaveRoom]);
 
   // Host emits state snapshot — throttled to avoid flooding
   const emitStateSnapshot = useCallback((snapshot) => {
@@ -172,5 +185,7 @@ export function useSession(user) {
     emitStateSnapshot,
     sendChatMessage,
     isInSession: !!sessionId,
+    sessionEnded,
+    dismissSessionEnded,
   };
 }

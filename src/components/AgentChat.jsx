@@ -1,12 +1,29 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { chatWithAgent, doctorChat } from '../services/api';
 
-const QUICK_QUESTIONS = [
+const ALL_QUICK_QUESTIONS = [
   'What are the key clinical findings?',
   'What are the limitations?',
   'How does this compare to guidelines?',
   'Who does this study apply to?',
+  'What methodology did they use?',
+  'Are there any conflicts of interest?',
+  'How large was the sample size?',
+  'What were the primary endpoints?',
+  'Is this a randomized controlled trial?',
+  'What are the clinical implications?',
+  'Were there any adverse events reported?',
+  'How does this compare to similar studies?',
+  'What follow-up duration was used?',
+  'What statistical methods were applied?',
+  'Is there any bias in the study design?',
+  'What patient population was studied?',
 ];
+
+function pickRandom(arr, n) {
+  const shuffled = [...arr].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, n);
+}
 
 // Extract repeated meaningful words from messages
 function detectRepeatedTopics(messages) {
@@ -40,11 +57,30 @@ function detectRepeatedTopics(messages) {
   return repeated.length > 0 ? repeated[0] : null;
 }
 
-export default function AgentChat({ paper, highlights, onQuestion, onNewTab, sessionNotes = [], onAddNote, allPapers = [], agentMessages: externalMessages, onAgentMessagesChange, agentOpen: externalOpen, onAgentOpenChange }) {
+// Detect if a question is general (not paper-specific)
+function isGeneralQuestion(text) {
+  const lower = text.toLowerCase().trim();
+  const generalPatterns = [
+    /^(?:what|how|why|when|where|who|can|does|is|are|do|should|would|could)\s+(?!this\s+(?:paper|study|research|article))/,
+    /^(?:tell|explain|describe|define)\s+(?:me\s+)?(?:about|what|how)\b/,
+    /^(?:i\s+(?:have|feel|am|get|had|got))\s+/,
+    /\b(?:my\s+(?:patient|doctor|health|symptoms?|condition|treatment|medication|diagnosis))\b/,
+    /\b(?:side\s+effects?|dosage|drug\s+interactions?|symptoms?\s+of)\b/,
+    /\b(?:difference\s+between|compared?\s+to|versus|vs\.?)\b(?!.*(?:this|the)\s+(?:paper|study))/,
+    /\b(?:general(?:ly)?|in\s+general|typically|usually)\b/,
+  ];
+  // Don't flag if they reference the paper/study
+  const paperRef = /\b(?:this\s+(?:paper|study|article|research)|the\s+(?:paper|study|authors?|abstract|findings?))\b/;
+  if (paperRef.test(lower)) return false;
+  return generalPatterns.some(re => re.test(lower));
+}
+
+export default function AgentChat({ paper, highlights, onQuestion, onNewTab, onSwitchToChat, sessionNotes = [], onAddNote, allPapers = [], agentMessages: externalMessages, onAgentMessagesChange, agentOpen: externalOpen, onAgentOpenChange }) {
   const [internalOpen, setInternalOpen] = useState(false);
   const isOpen = externalOpen !== undefined ? externalOpen : internalOpen;
   const setIsOpen = onAgentOpenChange || setInternalOpen;
   const [isExpanded, setIsExpanded] = useState(false);
+  const [quickQuestions, setQuickQuestions] = useState(() => pickRandom(ALL_QUICK_QUESTIONS, 4));
   const [internalMessages, setInternalMessages] = useState([]);
   const messages = externalMessages !== undefined ? externalMessages : internalMessages;
   const setMessages = onAgentMessagesChange
@@ -81,6 +117,7 @@ export default function AgentChat({ paper, highlights, onQuestion, onNewTab, ses
       setFloatingBubbles([]);
       setShowGreeting(true);
       setTopicSuggestion(null);
+      setQuickQuestions(pickRandom(ALL_QUICK_QUESTIONS, 4));
       prevPaperIdRef.current = paper?.paperId;
       timersRef.current.forEach(clearTimeout);
       timersRef.current = [];
@@ -218,7 +255,9 @@ export default function AgentChat({ paper, highlights, onQuestion, onNewTab, ses
         setTimeout(() => onNewTab(userSearchTopic), 800);
       }
 
-      setMessages((prev) => [...prev, { role: 'assistant', content: displayReply }]);
+      // If the user asked a general question, add a chat redirect hint
+      const isGeneral = isGeneralQuestion(text);
+      setMessages((prev) => [...prev, { role: 'assistant', content: displayReply, showChatHint: isGeneral }]);
 
       // Extract key finding for session notes
       if (onAddNote && data.reply && !data.reply.startsWith('Error') && data.reply !== 'Thinking...') {
@@ -369,7 +408,7 @@ export default function AgentChat({ paper, highlights, onQuestion, onNewTab, ses
         {/* Quick question chips */}
         {messages.length === 0 && paper && (
           <div className="agent-chips">
-            {QUICK_QUESTIONS.map((q, i) => (
+            {quickQuestions.map((q, i) => (
               <button key={i} className="agent-chip" onClick={() => { setInput(q); setTimeout(() => inputRef.current?.focus(), 50); }}>
                 {q}
               </button>
@@ -401,6 +440,12 @@ export default function AgentChat({ paper, highlights, onQuestion, onNewTab, ses
                 )}
                 <span>{msg.content}</span>
               </div>
+              {msg.showChatHint && onSwitchToChat && (
+                <div className="agent-chat-hint" onClick={onSwitchToChat}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                  For general medical questions, try the Chat tab for a better experience →
+                </div>
+              )}
             </div>
           );
         })}

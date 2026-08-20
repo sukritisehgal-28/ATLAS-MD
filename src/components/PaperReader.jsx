@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { askPaper, getPaperFullTextStatus } from '../services/api';
 import PaperDNA from './PaperDNA';
 
 const importanceColor = { critical: '#f87171', high: '#f59e0b', moderate: '#2563eb' };
@@ -81,6 +82,16 @@ function useAnnotationObserver() {
 }
 
 export default function PaperReader({ paper, highlights, highlightsLoading, rankedPapers, onSelectPaper, onSearchNewer, isBookmarked, onToggleBookmark, evidence }) {
+  // Full-text Q&A. A paper only has full text when PubMed Central carries it,
+  // so the panel states which mode it is in rather than silently degrading.
+  const [ftStatus, setFtStatus] = useState('unknown');
+  const [question, setQuestion] = useState('');
+  const [answer, setAnswer] = useState(null);
+  const [passages, setPassages] = useState([]);
+  const [asking, setAsking] = useState(false);
+  const [askError, setAskError] = useState('');
+  const [openPassage, setOpenPassage] = useState(null);
+
   const [speakingIndex, setSpeakingIndex] = useState(null);
   const [isSpeakingAll, setIsSpeakingAll] = useState(false);
   const [showSaveMenu, setShowSaveMenu] = useState(false);
@@ -99,6 +110,39 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
   }, []);
 
   // Cancel speech on unmount or paper change
+  useEffect(() => {
+    let cancelled = false;
+    setAnswer(null); setPassages([]); setAskError(''); setQuestion(''); setOpenPassage(null);
+    setFtStatus('unknown');
+    if (!paper?.paperId) return;
+    getPaperFullTextStatus(paper.paperId)
+      .then((r) => { if (!cancelled) setFtStatus(r.status); })
+      .catch(() => { if (!cancelled) setFtStatus('unknown'); });
+    return () => { cancelled = true; };
+  }, [paper?.paperId]);
+
+  const handleAsk = useCallback(async (e) => {
+    e?.preventDefault?.();
+    const q = question.trim();
+    if (!q || asking) return;
+    setAsking(true); setAskError(''); setAnswer(null); setPassages([]);
+    try {
+      const res = await askPaper(paper, q);
+      if (res.grounded) {
+        setAnswer(res.answer);
+        setPassages(res.passages || []);
+        setFtStatus('indexed');
+      } else {
+        setFtStatus('unavailable');
+        setAskError('Full text is not available for this paper, so answers would be guesses rather than quotes. Only the abstract is indexed.');
+      }
+    } catch (err) {
+      setAskError(err.message || 'Could not answer from the full text.');
+    } finally {
+      setAsking(false);
+    }
+  }, [question, asking, paper]);
+
   useEffect(() => {
     return () => {
       window.speechSynthesis.cancel();
@@ -226,45 +270,16 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
 
   return (
     <div className="paper-reader">
-      {/* Scoped styles for annotation animations and card textures */}
+      {/* Scoped styles for annotation animations */}
       <style>{`
         .annotation-card-animated {
           opacity: 0;
-          transform: translateX(-30px);
-          transition: opacity 0.5s ease-out, transform 0.5s ease-out;
-          background-image:
-            repeating-linear-gradient(
-              0deg,
-              transparent,
-              transparent 2px,
-              rgba(255,255,255,0.008) 2px,
-              rgba(255,255,255,0.008) 4px
-            ),
-            repeating-linear-gradient(
-              90deg,
-              transparent,
-              transparent 2px,
-              rgba(255,255,255,0.005) 2px,
-              rgba(255,255,255,0.005) 4px
-            );
+          transform: translateY(8px);
+          transition: opacity 0.4s ease-out, transform 0.4s ease-out;
         }
         .annotation-card-animated.annotation-visible {
           opacity: 1;
-          transform: translateX(0);
-        }
-        .annotation-card-pointer {
-          position: relative;
-        }
-        .annotation-card-pointer::before {
-          content: '';
-          position: absolute;
-          top: 14px;
-          left: -8px;
-          width: 0;
-          height: 0;
-          border-top: 6px solid transparent;
-          border-bottom: 6px solid transparent;
-          border-right: 8px solid var(--pointer-color, #2563eb35);
+          transform: translateY(0);
         }
         .age-banner {
           display: flex;
@@ -419,9 +434,9 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
             <div className="highlights-loading-text">Analyzing this paper...</div>
           </div>
         ) : (
-          <div>
+          <div className="annotation-sections">
             {sections.map((section, i) => (
-              <div key={i} style={{ marginBottom: 20 }}>
+              <div key={i} className="annotation-section">
                 {/* Text passage */}
                 <div
                   className={`annotation-passage ${section.highlight ? 'highlighted' : ''}`}
@@ -433,46 +448,39 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
                   {section.text}
                 </div>
 
-                {/* Annotation drop */}
+                {/* Annotation card — compact inline below highlighted text */}
                 {section.highlight && (
-                  <div className="annotation-drop fadein">
-                    <div
-                      className="annotation-connector"
-                      style={{ background: importanceColor[section.highlight.importance] }}
-                    />
-                    <div
-                      ref={(el) => setCardRef(i, el)}
-                      className="annotation-card annotation-card-animated annotation-card-pointer"
-                      style={{
-                        border: `1px solid ${importanceColor[section.highlight.importance]}35`,
-                        borderLeft: `3px solid ${importanceColor[section.highlight.importance]}`,
-                        background: importanceBg[section.highlight.importance],
-                        '--pointer-color': `${importanceColor[section.highlight.importance]}35`,
-                      }}
-                    >
-                      <div className="annotation-badge-row">
-                        <span
-                          className="annotation-importance"
-                          style={{
-                            background: `${importanceColor[section.highlight.importance]}20`,
-                            border: `1px solid ${importanceColor[section.highlight.importance]}50`,
-                            color: importanceColor[section.highlight.importance],
-                          }}
-                        >
-                          {typeIcon[section.highlight.type]} {section.highlight.importance?.toUpperCase()}
-                        </span>
-                        <span className="annotation-type">
-                          {typeLabel[section.highlight.type]}
-                        </span>
-                        <button
-                          className="annotation-listen"
-                          onClick={() => speak(section.highlight.text, i)}
-                        >
-                          {speakingIndex === i ? '■ stop' : '▶ listen'}
-                        </button>
-                      </div>
-                      <div className="annotation-text">{section.highlight.text}</div>
+                  <div
+                    ref={(el) => setCardRef(i, el)}
+                    className="annotation-card annotation-card-animated"
+                    style={{
+                      border: `1px solid ${importanceColor[section.highlight.importance]}20`,
+                      borderLeft: `2px solid ${importanceColor[section.highlight.importance]}`,
+                      background: importanceBg[section.highlight.importance],
+                    }}
+                  >
+                    <div className="annotation-badge-row">
+                      <span
+                        className="annotation-importance"
+                        style={{
+                          background: `${importanceColor[section.highlight.importance]}18`,
+                          border: `1px solid ${importanceColor[section.highlight.importance]}40`,
+                          color: importanceColor[section.highlight.importance],
+                        }}
+                      >
+                        {typeIcon[section.highlight.type]} {section.highlight.importance?.toUpperCase()}
+                      </span>
+                      <span className="annotation-type">
+                        {typeLabel[section.highlight.type]}
+                      </span>
+                      <button
+                        className="annotation-listen"
+                        onClick={() => speak(section.highlight.text, i)}
+                      >
+                        {speakingIndex === i ? '■ stop' : '▶ listen'}
+                      </button>
                     </div>
+                    <div className="annotation-text">{section.highlight.text}</div>
                   </div>
                 )}
               </div>
@@ -494,6 +502,60 @@ export default function PaperReader({ paper, highlights, highlightsLoading, rank
             )}
           </div>
         )}
+
+        {/* Ask the full text (RAG) */}
+        <div className="ft-panel">
+          <div className="ft-head">
+            <span className="ft-title">ASK THIS PAPER</span>
+            <span className={`ft-badge ft-${ftStatus === 'indexed' ? 'on' : ftStatus === 'unavailable' ? 'off' : 'idle'}`}>
+              {ftStatus === 'indexed' ? 'FULL TEXT INDEXED'
+                : ftStatus === 'unavailable' ? 'ABSTRACT ONLY'
+                : 'FULL TEXT ON DEMAND'}
+            </span>
+          </div>
+          <p className="ft-sub">
+            Answers are generated only from passages retrieved out of the paper&apos;s full text, and every claim cites the passage it came from.
+          </p>
+          <form className="ft-form" onSubmit={handleAsk}>
+            <input
+              className="ft-input"
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              placeholder="e.g. What were the limitations? How many patients were enrolled?"
+              disabled={asking}
+            />
+            <button className="btn btn-sm ft-btn" type="submit" disabled={asking || !question.trim()}>
+              {asking ? 'Reading…' : 'Ask'}
+            </button>
+          </form>
+
+          {asking && <div className="ft-status">Fetching full text, retrieving relevant passages…</div>}
+          {askError && <div className="ft-error">{askError}</div>}
+
+          {answer && (
+            <div className="ft-answer">
+              <div className="ft-answer-text">{answer}</div>
+              {passages.length > 0 && (
+                <div className="ft-cites">
+                  <div className="ft-cites-label">CITED PASSAGES</div>
+                  {passages.map((p) => (
+                    <div key={p.n} className="ft-cite">
+                      <button
+                        className="ft-cite-head"
+                        onClick={() => setOpenPassage(openPassage === p.n ? null : p.n)}
+                      >
+                        <span className="ft-cite-n">[{p.n}]</span>
+                        <span className="ft-cite-sec">{p.section}</span>
+                        <span className="ft-cite-score">{p.score}</span>
+                      </button>
+                      {openPassage === p.n && <div className="ft-cite-text">{p.text}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
 
         {/* Next paper button */}
         {nextPaper && (

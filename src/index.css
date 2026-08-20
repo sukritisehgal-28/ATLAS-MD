@@ -210,6 +210,40 @@ a { color: var(--text-accent); text-decoration: none; }
   cursor: pointer; font-size: 13px; text-decoration: none;
 }
 .login-switch button:hover { text-decoration: underline; }
+
+.login-divider {
+  display: flex; align-items: center; gap: 12px; margin: 16px 0;
+}
+.login-divider::before, .login-divider::after {
+  content: ''; flex: 1; height: 1px; background: var(--border, rgba(255,255,255,0.1));
+}
+.login-divider span {
+  font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);
+  letter-spacing: 0.04em; white-space: nowrap;
+}
+
+.login-demo-buttons {
+  display: flex; gap: 8px;
+}
+.login-demo-btn {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 12px 8px; border-radius: 8px; cursor: pointer;
+  background: var(--bg-input, rgba(255,255,255,0.04));
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  color: var(--text-secondary); transition: all 0.15s;
+}
+.login-demo-btn:hover {
+  background: var(--accent-subtle, rgba(37, 99, 235, 0.08));
+  border-color: var(--accent, #2563eb);
+  color: var(--text-primary);
+}
+.login-demo-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.login-demo-icon { font-size: 20px; }
+.login-demo-label {
+  font-size: 10px; font-family: var(--font-mono); letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
 .login-footer {
   font-size: 11px; color: var(--text-muted); margin-top: 24px;
   font-family: var(--font-mono); letter-spacing: 0.04em;

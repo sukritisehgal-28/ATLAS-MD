@@ -1,9 +1,15 @@
-const API_BASE = 'http://localhost:3001/api';
+const API_BASE = (import.meta.env.VITE_API_URL || (import.meta.env.PROD ? '' : 'http://localhost:3001')) + '/api';
 
 function getAuthHeaders() {
   const token = localStorage.getItem('atlas-token');
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = `Bearer ${token}`;
+  // Send user's own API keys if configured
+  try {
+    const keys = JSON.parse(localStorage.getItem('atlas-api-keys') || '{}');
+    if (keys.gemini) headers['X-Gemini-Key'] = keys.gemini;
+    if (keys.semanticScholar) headers['X-Scholar-Key'] = keys.semanticScholar;
+  } catch {}
   return headers;
 }
 
@@ -133,6 +139,24 @@ export async function getCitationChain(paperId, direction) {
 
 export async function getFollowUpQuestions(messages) {
   return post('/follow-up-questions', { messages });
+}
+
+// Full-text retrieval (RAG)
+export async function askPaper(paper, question) {
+  return post('/paper/ask', { paper, question });
+}
+
+export async function indexPaperFullText(paper) {
+  return post('/paper/index', { paper });
+}
+
+export async function getPaperFullTextStatus(paperId) {
+  const token = localStorage.getItem('atlas-token');
+  const res = await fetch(`${API_BASE}/paper/${paperId}/status`, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  if (!res.ok) return { status: 'unknown' };
+  return res.json();
 }
 
 // Sessions

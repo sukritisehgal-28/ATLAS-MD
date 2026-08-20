@@ -13,6 +13,8 @@ lerna-debug.log*
 node_modules
 dist
 atlas.db
+atlas.db-shm
+atlas.db-wal
 dist-ssr
 *.local
 

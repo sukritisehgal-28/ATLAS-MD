@@ -7,32 +7,162 @@ import jwt from 'jsonwebtoken';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { router as authRouter, requireAuth } from './auth.js';
 import db from './db.js';
+import { JWT_SECRET, isProduction } from './config.js';
+import { indexPaper, retrieve, getPaperStatus } from './rag.js';
+
+// Simple in-memory rate limiter
+const rateLimitMap = new Map();
+function rateLimit(windowMs, maxRequests) {
+  return (req, res, next) => {
+    const key = req.ip;
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    let hits = rateLimitMap.get(key) || [];
+    hits = hits.filter(t => t > windowStart);
+    if (hits.length >= maxRequests) {
+      return res.status(429).json({ error: 'Too many requests. Please try again later.' });
+    }
+    hits.push(now);
+    rateLimitMap.set(key, hits);
+    next();
+  };
+}
+// Clean up old entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, hits] of rateLimitMap) {
+    const filtered = hits.filter(t => t > now - 900000);
+    if (filtered.length === 0) rateLimitMap.delete(key);
+    else rateLimitMap.set(key, filtered);
+  }
+}, 300000);
 
 const app = express();
+
+// Behind the TLS reverse proxy the real client IP arrives in X-Forwarded-For.
+// Without this every request appears to come from the proxy itself and the whole
+// site shares a single rate-limit bucket.
+app.set('trust proxy', isProduction ? 1 : false);
+
 const httpServer = createServer(app);
+
+const allowedOrigins = (process.env.CORS_ORIGIN ||
+  (isProduction ? 'https://atlasmd.live,https://www.atlasmd.live' : 'http://localhost:5173'))
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
 const io = new Server(httpServer, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+  cors: { origin: allowedOrigins, methods: ['GET', 'POST'] },
 });
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(express.json({ limit: '1mb' }));
 
-// Auth routes (unprotected)
-app.use('/api/auth', authRouter);
+// Rate-limit ceilings, overridable so the integration test suite can run its
+// request bursts without tripping the limiter.
+const AUTH_RATE_LIMIT = Number(process.env.AUTH_RATE_LIMIT) || 10;
+const API_RATE_LIMIT = Number(process.env.API_RATE_LIMIT) || 120;
 
-// All other /api routes require authentication
-app.use('/api', requireAuth);
+// Auth routes (unprotected, rate-limited)
+app.use('/api/auth', rateLimit(60000, AUTH_RATE_LIMIT), authRouter);
 
-const genAI = new GoogleGenerativeAI(process.env.Gemini_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+// All other /api routes require authentication (rate-limited).
+// A single research query fans out to ~6 endpoints, plus one per paper opened,
+// so this ceiling has to sit well above "one request per user action".
+app.use('/api', rateLimit(60000, API_RATE_LIMIT), requireAuth);
 
-async function askGemini(prompt, maxTokens = 1024) {
-  const result = await model.generateContent({
+// Default Gemini client (server-level key)
+const defaultGenAI = process.env.Gemini_API_KEY ? new GoogleGenerativeAI(process.env.Gemini_API_KEY) : null;
+
+// Model selection is a fallback CHAIN, not a single name, for two reasons:
+//
+//  1. Pinned versions get retired. The originally hardcoded 2.5-flash build was
+//     withdrawn from new users, which silently broke every AI feature.
+//  2. The Gemini free tier grants only ~20 requests per DAY *per model*, but
+//     that quota is counted separately for each one. Rolling to the next model
+//     when one is exhausted multiplies the daily budget without ever leaving
+//     the free tier — which is the point, since the demo key belongs to a
+//     project with billing disabled and must never be able to incur a charge.
+//
+// Override with GEMINI_MODELS (comma-separated) to re-order or pin.
+const GEMINI_MODELS = (process.env.GEMINI_MODELS ||
+  'gemini-3.1-flash-lite,gemini-flash-latest,gemini-3-flash-preview,gemini-3.5-flash,gemini-3.7-flash')
+  .split(',').map((m) => m.trim()).filter(Boolean);
+
+// Gemini 3.x spends output budget on internal reasoning before answering. That
+// silently truncated JSON against these maxOutputTokens ceilings and burns
+// free-tier quota, so reasoning is disabled for every call here.
+const NO_THINKING = { thinkingBudget: 0 };
+
+// Prefer the user's own key from Settings, fall back to the server key.
+function getGeminiClient(req) {
+  const userKey = req?.headers?.['x-gemini-key'];
+  const ai = userKey ? new GoogleGenerativeAI(userKey) : defaultGenAI;
+  if (!ai) throw new Error('No Gemini API key configured. Please add your key in Settings.');
+  return ai;
+}
+
+// Get Semantic Scholar API key — prefer user's, fall back to server
+function getScholarKey(req) {
+  return req?.headers?.['x-scholar-key'] || process.env.SEMANTIC_SCHOLAR_API_KEY;
+}
+
+const RETRYABLE = [429, 500, 502, 503, 504];
+
+function classifyError(err) {
+  const msg = String(err?.message || '');
+  return {
+    status: Number(msg.match(/\[(\d{3})\s/)?.[1]),
+    // A per-day quota will not recover by waiting, so move to the next model.
+    // A per-minute one will, so it is worth sleeping for.
+    exhaustedForToday: /PerDay/.test(msg),
+    advisedSeconds: Number(msg.match(/retry in (\d+(?:\.\d+)?)s/)?.[1]),
+  };
+}
+
+// Try each model in turn; within a model, retry transient failures with backoff.
+async function generateWithFallback(req, request, { tools } = {}) {
+  const ai = getGeminiClient(req);
+  let lastErr;
+
+  for (const name of GEMINI_MODELS) {
+    const model = ai.getGenerativeModel(tools ? { model: name, tools } : { model: name });
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await model.generateContent(request);
+      } catch (err) {
+        lastErr = err;
+        const { status, exhaustedForToday, advisedSeconds } = classifyError(err);
+
+        if (!RETRYABLE.includes(status)) throw err;
+        if (exhaustedForToday) {
+          console.warn(`[gemini] ${name} out of daily free-tier quota, trying next model`);
+          break;
+        }
+        if (attempt === 1) {
+          console.warn(`[gemini] ${name} still failing (${status}), trying next model`);
+          break;
+        }
+        // Honour the server's own figure — plain backoff undershoots the window.
+        const delay = Math.min(Math.max((advisedSeconds || 1) * 1000 + 500, 1000), 25000);
+        console.warn(`[gemini] ${name} returned ${status}, retrying in ${Math.round(delay)}ms`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+
+  console.error('[gemini] every model in the chain failed');
+  throw lastErr;
+}
+
+async function askGemini(prompt, maxTokens = 1024, req = null) {
+  const result = await generateWithFallback(req, {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: { maxOutputTokens: maxTokens },
+    generationConfig: { maxOutputTokens: maxTokens, thinkingConfig: NO_THINKING },
   });
   const resp = result.response;
-  // Collect all text parts from candidates
   const parts = resp.candidates?.[0]?.content?.parts || [];
   return parts.map((p) => p.text || '').join('');
 }
@@ -163,12 +293,13 @@ function repairJSON(text) {
   return {};
 }
 
-async function askGeminiJSON(prompt, maxTokens = 8192) {
-  const result = await model.generateContent({
+async function askGeminiJSON(prompt, maxTokens = 8192, req = null) {
+  const result = await generateWithFallback(req, {
     contents: [{ role: 'user', parts: [{ text: prompt + '\n\nIMPORTANT: Keep your JSON response concise. Use short strings. Do NOT exceed the output limit.' }] }],
     generationConfig: {
       maxOutputTokens: maxTokens,
       responseMimeType: 'application/json',
+      thinkingConfig: NO_THINKING,
     },
   });
   const text = result.response.text();
@@ -176,15 +307,16 @@ async function askGeminiJSON(prompt, maxTokens = 8192) {
 }
 
 // --- Semantic Scholar proxy ---
-async function searchSemanticScholar(query, limit = 15, yearRange = null) {
+async function searchSemanticScholar(query, limit = 15, yearRange = null, req = null) {
   const headers = {};
-  if (process.env.SEMANTIC_SCHOLAR_API_KEY) {
-    headers['x-api-key'] = process.env.SEMANTIC_SCHOLAR_API_KEY;
+  const scholarKey = getScholarKey(req);
+  if (scholarKey) {
+    headers['x-api-key'] = scholarKey;
   }
   const params = new URLSearchParams({
     query,
     limit: String(limit),
-    fields: 'paperId,title,abstract,year,citationCount,authors,url,openAccessPdf',
+    fields: 'paperId,title,abstract,year,citationCount,authors,url,openAccessPdf,externalIds',
   });
   if (yearRange) {
     params.set('year', yearRange); // e.g. "2022-2026"
@@ -209,7 +341,9 @@ app.post('/api/extract-research-query', async (req, res) => {
       .map((m) => `${m.role === 'user' ? 'Doctor' : 'AI'}: ${m.content}`)
       .join('\n');
     const json = await askGeminiJSON(
-      `You are a medical research search query builder. A doctor has been chatting with an AI assistant and now wants to search for research papers. Analyze the full conversation below and extract the most relevant medical topic or clinical question they've been discussing.\n\nReturn JSON: {"query":"a concise search query (3-8 words) optimized for searching medical literature databases like Semantic Scholar","concepts":["concept1","concept2","concept3"]}\n\nPick up on specific conditions, drugs, mechanisms, treatments, or clinical scenarios mentioned. Focus on the medical substance, not conversational filler.\n\nConversation:\n${transcript}`
+      `You are a medical research search query builder. A doctor has been chatting with an AI assistant and now wants to search for research papers. Analyze the full conversation below and extract the most relevant medical topic or clinical question they've been discussing.\n\nReturn JSON: {"query":"a concise search query (3-8 words) optimized for searching medical literature databases like Semantic Scholar","concepts":["concept1","concept2","concept3"]}\n\nPick up on specific conditions, drugs, mechanisms, treatments, or clinical scenarios mentioned. Focus on the medical substance, not conversational filler.\n\nConversation:\n${transcript}`,
+      8192,
+      req
     );
     res.json(json);
   } catch (err) {
@@ -223,7 +357,9 @@ app.post('/api/extract-concepts', async (req, res) => {
   try {
     const { description } = req.body;
     const json = await askGeminiJSON(
-      `Medical NLP. Extract key clinical concepts from a doctor's patient description. Return JSON: {"concepts":["c1","c2","c3"]}. Maximum 3 concepts. Be specific and clinically precise — prefer conditions and mechanisms over vague symptoms.\n\nPatient description: ${description}`
+      `Medical NLP. Extract key clinical concepts from a doctor's patient description. Return JSON: {"concepts":["c1","c2","c3"]}. Maximum 3 concepts. Be specific and clinically precise — prefer conditions and mechanisms over vague symptoms.\n\nPatient description: ${description}`,
+      8192,
+      req
     );
     res.json(json);
   } catch (err) {
@@ -237,7 +373,7 @@ app.post('/api/search-papers', async (req, res) => {
   try {
     const { concepts, yearRange } = req.body;
     const query = concepts.join(' ');
-    const allPapers = await searchSemanticScholar(query, 20, yearRange || null);
+    const allPapers = await searchSemanticScholar(query, 20, yearRange || null, req);
     // Filter out papers without abstracts — they're not useful for analysis
     const papers = allPapers.filter(p => p.abstract && p.abstract.trim().length > 0).slice(0, 15);
     res.json({ papers });
@@ -279,7 +415,8 @@ app.post('/api/analyze-relationships', async (req, res) => {
     } else {
       const json = await askGeminiJSON(
         `Medical research analyst. Return JSON: {"relationships":[{"paper1_id":"id","paper2_id":"id","type":"shared_concept|contradiction|methodology","strength":0.8,"reason":"short reason"}]}.\nUse EXACT IDs: ${JSON.stringify(validIds)}\nPapers:\n${paperSummaries.join('\n')}`,
-        4096
+        4096,
+        req
       );
       relationships = json.relationships || json;
     }
@@ -302,7 +439,8 @@ app.post('/api/summarize-papers', async (req, res) => {
     const { papers } = req.body;
     const json = await askGeminiJSON(
       `For each of the following medical research papers, write exactly 4 concise lines for a clinician. Cover: key finding, patient population, primary outcome, clinical relevance. Be specific. No hedging. Return a JSON object: {"summaries": {"paperId": "4-line summary", ...}}.\n\nPapers:\n${papers.map((p) => `ID: ${p.paperId} | Title: ${p.title} | Abstract: ${(p.abstract || 'No abstract').slice(0, 300)}`).join('\n\n')}`,
-      4096
+      4096,
+      req
     );
     res.json(json);
   } catch (err) {
@@ -317,6 +455,28 @@ app.post('/api/extract-highlights', async (req, res) => {
     const { paper } = req.body;
     let highlights;
 
+    // An abstract rarely states sample sizes or limitations, so when full text
+    // has been indexed, pull the passages that actually discuss them and let
+    // the model work from those instead.
+    let evidence = paper.abstract || 'No abstract available';
+    let groundedInFullText = false;
+    if (getPaperStatus(paper.paperId)?.status === 'indexed') {
+      try {
+        const passages = await retrieve(
+          paper.paperId,
+          'key findings, primary outcome, methodology, sample size, limitations of the study',
+          req,
+          6
+        );
+        if (passages.length) {
+          evidence = passages.map((x) => `(${x.section}) ${x.text}`).join('\n\n');
+          groundedInFullText = true;
+        }
+      } catch (e) {
+        console.warn('highlight retrieval failed, using abstract:', e.message);
+      }
+    }
+
     if (process.env.CLAUDE_API_KEY) {
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -329,7 +489,7 @@ app.post('/api/extract-highlights', async (req, res) => {
           model: 'claude-sonnet-4-20250514',
           max_tokens: 1000,
           system: `Extract 4-5 clinically important highlights. Return ONLY valid JSON array:\n[{"text":"finding max 30 words","importance":"critical|high|moderate","type":"finding|method|conclusion|limitation","passage":"verbatim substring from abstract"}]\nNEVER fabricate info not in the abstract.`,
-          messages: [{ role: 'user', content: `Title: ${paper.title}\nYear: ${paper.year}\nAbstract: ${paper.abstract || 'No abstract available'}` }],
+          messages: [{ role: 'user', content: `Title: ${paper.title}\nYear: ${paper.year}\n${groundedInFullText ? 'Excerpts from full text' : 'Abstract'}: ${evidence}` }],
         }),
       });
       const data = await response.json();
@@ -338,13 +498,14 @@ app.post('/api/extract-highlights', async (req, res) => {
       highlights = JSON.parse(text.replace(/```json|```/g, '').trim());
     } else {
       const json = await askGeminiJSON(
-        `Extract 4-5 clinically important highlights. Return JSON: {"highlights":[{"text":"highlight","importance":"critical|high|moderate","type":"finding|method|conclusion|limitation","passage":"verbatim sentence from abstract"}]}.\n\nTitle: ${paper.title}\nAbstract: ${paper.abstract || 'No abstract available'}`,
-        1024
+        `Extract 4-5 clinically important highlights. Return JSON: {"highlights":[{"text":"highlight","importance":"critical|high|moderate","type":"finding|method|conclusion|limitation","passage":"verbatim sentence from the source text"}]}.\n\nEvery passage must be copied verbatim from the source text below — never invent one.\n\nTitle: ${paper.title}\n${groundedInFullText ? 'Full-text excerpts' : 'Abstract'}: ${evidence}`,
+        1024,
+        req
       );
       highlights = json.highlights || (Array.isArray(json) ? json : []);
     }
 
-    res.json({ highlights: Array.isArray(highlights) ? highlights : [] });
+    res.json({ highlights: Array.isArray(highlights) ? highlights : [], groundedInFullText });
   } catch (err) {
     console.error('extract-highlights error:', err);
     res.status(500).json({ error: err.message });
@@ -479,9 +640,9 @@ ACTIONS:
       lastRole = role;
     }
 
-    const result = await model.generateContent({
+    const result = await generateWithFallback(req, {
       contents,
-      generationConfig: { maxOutputTokens: 1024 },
+      generationConfig: { maxOutputTokens: 1024, thinkingConfig: NO_THINKING },
     });
     const reply = result?.response?.text?.() || 'Sorry, I couldn\'t generate a response. Please try again.';
     res.json({ reply });
@@ -532,9 +693,9 @@ Please acknowledge you're ready.` }],
       lastRole = role;
     }
 
-    const result = await model.generateContent({
+    const result = await generateWithFallback(req, {
       contents,
-      generationConfig: { maxOutputTokens: 2048 },
+      generationConfig: { maxOutputTokens: 2048, thinkingConfig: NO_THINKING },
     });
     const reply = result?.response?.text?.() || 'Sorry, I couldn\'t generate a response. Please try again.';
     res.json({ reply });
@@ -548,12 +709,6 @@ Please acknowledge you're ready.` }],
 app.post('/api/doctor-chat-web', async (req, res) => {
   try {
     const { messages } = req.body;
-
-    // Create a model with search grounding
-    const webModel = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-      tools: [{ googleSearch: {} }],
-    });
 
     const contents = [];
     contents.push({
@@ -587,10 +742,11 @@ Please acknowledge you're ready.` }],
       lastRole = role;
     }
 
-    const result = await webModel.generateContent({
+    // Search grounding runs through the same fallback chain.
+    const result = await generateWithFallback(req, {
       contents,
-      generationConfig: { maxOutputTokens: 2048 },
-    });
+      generationConfig: { maxOutputTokens: 2048, thinkingConfig: NO_THINKING },
+    }, { tools: [{ googleSearch: {} }] });
     const reply = result?.response?.text?.() || 'Sorry, I couldn\'t generate a response. Please try again.';
     res.json({ reply });
   } catch (err) {
@@ -612,7 +768,7 @@ Paper 2: "${paper2.title}" (${paper2.year})
 Abstract: ${paper2.abstract || 'No abstract available'}
 
 Provide exactly 3 sentences explaining the contradiction.`;
-    const explanation = await askGemini(prompt);
+    const explanation = await askGemini(prompt, 1024, req);
     res.json({ explanation });
   } catch (err) {
     console.error('explain-contradiction error:', err);
@@ -652,7 +808,7 @@ Return JSON: {"readingList":[{"paperId":"exact_id","reason":"one-line reason"}, 
 
 Papers:
 ${paperSummaries.join('\n')}`;
-    const json = await askGeminiJSON(prompt, 4096);
+    const json = await askGeminiJSON(prompt, 4096, req);
     console.log('[build-reading-list] Response keys:', Object.keys(json), 'readingList length:', json.readingList?.length);
     // Normalize: Gemini might return the array directly or wrapped
     const list = json.readingList || (Array.isArray(json) ? json : []);
@@ -680,7 +836,7 @@ app.post('/api/extend-reading-list', async (req, res) => {
     }
 
     const prompt = `Rank these remaining papers in reading order for a doctor who searched "${query}".${profileContext}\n\nReturn JSON: {"readingList":[{"paperId":"exact_id","reason":"one-line reason"}, ...]}\n\nPapers:\n${paperSummaries.join('\n')}`;
-    const json = await askGeminiJSON(prompt, 4096);
+    const json = await askGeminiJSON(prompt, 4096, req);
     const list = json.readingList || (Array.isArray(json) ? json : []);
     res.json({ readingList: list });
   } catch (err) {
@@ -720,7 +876,7 @@ Key highlights extracted:
 ${highlightText}
 
 Write in clear clinical language. Be specific and evidence-based. Keep it concise but thorough.`;
-    const brief = await askGemini(prompt, 3000);
+    const brief = await askGemini(prompt, 3000, req);
     res.json({ brief });
   } catch (err) {
     console.error('generate-brief error:', err);
@@ -750,7 +906,8 @@ Return JSON: {"evidence":{"paperId":{"level":1-6,"type":"Systematic Review|RCT|C
 
 Papers:
 ${paperSummaries.join('\n')}`,
-      4096
+      4096,
+      req
     );
     res.json(json);
   } catch (err) {
@@ -844,7 +1001,8 @@ Return JSON: {
 
 Papers:
 ${paperDetails.join('\n\n---\n\n')}`,
-      4096
+      4096,
+      req
     );
     res.json(json);
   } catch (err) {
@@ -856,10 +1014,17 @@ ${paperDetails.join('\n\n---\n\n')}`,
 // Get citation chain (cited by / cites) from Semantic Scholar
 app.post('/api/citation-chain', async (req, res) => {
   try {
-    const { paperId, direction } = req.body; // direction: 'citations' (cited by) or 'references' (cites)
+    const { paperId, direction } = req.body;
+    if (!paperId || typeof paperId !== 'string' || !/^[a-f0-9]{40}$/.test(paperId)) {
+      return res.status(400).json({ error: 'Invalid paper ID format.' });
+    }
+    if (!['citations', 'references'].includes(direction)) {
+      return res.status(400).json({ error: 'Invalid direction.' });
+    } // direction: 'citations' (cited by) or 'references' (cites)
     const headers = {};
-    if (process.env.SEMANTIC_SCHOLAR_API_KEY) {
-      headers['x-api-key'] = process.env.SEMANTIC_SCHOLAR_API_KEY;
+    const scholarKey = getScholarKey(req);
+    if (scholarKey) {
+      headers['x-api-key'] = scholarKey;
     }
     const fields = 'paperId,title,year,citationCount,authors,abstract';
     const url = `https://api.semanticscholar.org/graph/v1/paper/${paperId}/${direction}?fields=${fields}&limit=10`;
@@ -898,11 +1063,103 @@ Return JSON: {"questions":["q1"]}
 Under 60 characters. Make it the most interesting or clinically relevant follow-up.
 
 Conversation:
-${transcript}`
+${transcript}`,
+      8192,
+      req
     );
     res.json(json);
   } catch (err) {
     console.error('follow-up-questions error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== Full-text retrieval (RAG) =====
+
+// Fetch, chunk and embed a paper's full text. Safe to call repeatedly — an
+// already-indexed paper returns from cache without re-embedding.
+app.post('/api/paper/index', async (req, res) => {
+  try {
+    const { paper } = req.body;
+    if (!paper?.paperId) return res.status(400).json({ error: 'paper.paperId is required.' });
+    res.json(await indexPaper(paper, req));
+  } catch (err) {
+    console.error('paper/index error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Whether full text is already available, so the UI can label a paper as
+// full-text or abstract-only rather than silently degrading.
+app.get('/api/paper/:paperId/status', (req, res) => {
+  const row = getPaperStatus(req.params.paperId);
+  res.json({
+    status: row?.status || 'unknown',
+    chunkCount: row?.chunk_count || 0,
+    sourceUrl: row?.source_url || null,
+  });
+});
+
+// Answer a question grounded in retrieved passages, with citations.
+app.post('/api/paper/ask', async (req, res) => {
+  try {
+    const { paper, question } = req.body;
+    if (!paper?.paperId || !question) {
+      return res.status(400).json({ error: 'paper and question are required.' });
+    }
+
+    // Index on first use so the client never has to sequence two calls.
+    let status = getPaperStatus(paper.paperId);
+    if (status?.status !== 'indexed') {
+      const result = await indexPaper(paper, req);
+      if (result.status !== 'indexed') {
+        return res.json({
+          grounded: false,
+          reason: result.reason || 'full_text_unavailable',
+          answer: null,
+          passages: [],
+        });
+      }
+      status = getPaperStatus(paper.paperId);
+    }
+
+    const passages = await retrieve(paper.paperId, question, req, 6);
+    if (!passages.length) {
+      return res.json({ grounded: false, reason: 'no_passages', answer: null, passages: [] });
+    }
+
+    const numbered = passages
+      .map((p, i) => `[${i + 1}] (section: ${p.section})\n${p.text}`)
+      .join('\n\n');
+
+    const prompt = `You are helping a clinician read a specific paper. Answer their question using ONLY the numbered passages below, which are verbatim excerpts from the paper's full text.
+
+Rules:
+- Cite the passage number inline for every claim, like [1] or [2].
+- If the passages do not contain the answer, say so plainly. Do NOT use outside knowledge or guess.
+- Plain text only. No markdown, no asterisks, no headers.
+- 2-4 sentences. Be specific with numbers, populations and endpoints.
+
+Paper: "${paper.title}"
+Question: ${question}
+
+Passages:
+${numbered}`;
+
+    const answer = await askGemini(prompt, 800, req);
+    res.json({
+      grounded: true,
+      answer,
+      passages: passages.map((p, i) => ({
+        n: i + 1,
+        section: p.section,
+        text: p.text,
+        score: Number(p.score.toFixed(3)),
+      })),
+      sourceUrl: status?.source_url || null,
+    });
+  } catch (err) {
+    console.error('paper/ask error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1040,7 +1297,6 @@ app.get('/api/sessions', (req, res) => {
 
 // ===== Socket.io for real-time collaboration =====
 
-const JWT_SECRET = process.env.JWT_SECRET || 'atlas-dev-secret-change-in-production';
 
 // Track active users per room: { sessionId: { socketId: { userId, name, email } } }
 const activeRooms = {};
@@ -1055,14 +1311,11 @@ io.engine.on('connection', (rawSocket) => {
 // Authenticate socket connections
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
-  console.log('[Socket Auth] Attempt - token present:', !!token);
-  if (!token) { console.log('[Socket Auth] REJECTED: no token'); return next(new Error('Authentication required')); }
+  if (!token) { return next(new Error('Authentication required')); }
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    console.log('[Socket Auth] Decoded userId:', decoded.userId);
     const user = db.prepare('SELECT id, email, name FROM users WHERE id = ?').get(decoded.userId);
-    if (!user) { console.log('[Socket Auth] REJECTED: user not found'); return next(new Error('User not found')); }
-    console.log('[Socket Auth] OK:', user.name);
+    if (!user) { return next(new Error('User not found')); }
     socket.user = user;
     next();
   } catch (err) {
@@ -1127,29 +1380,32 @@ io.on('connection', (socket) => {
 
   // Host broadcasts their entire app state — relay to all members
   socket.on('state-snapshot', (data) => {
-    if (socket.sessionId) {
-      socket.to(socket.sessionId).emit('state-snapshot', data);
-    }
+    if (!socket.sessionId) return;
+    // Only the host can broadcast state snapshots
+    const session = db.prepare('SELECT created_by FROM sessions WHERE id = ?').get(socket.sessionId);
+    if (!session || session.created_by !== socket.user.id) return;
+    socket.to(socket.sessionId).emit('state-snapshot', data);
   });
 
   // Chat messages
   socket.on('chat-message', (data) => {
-    if (socket.sessionId) {
-      const msg = {
-        id: Date.now(),
-        text: data.text,
-        from: socket.user.name,
-        userId: socket.user.id,
-        timestamp: new Date().toISOString(),
-      };
-      if (roomState[socket.sessionId]) {
-        roomState[socket.sessionId].chatMessages.push(msg);
-        if (roomState[socket.sessionId].chatMessages.length > 100) {
-          roomState[socket.sessionId].chatMessages = roomState[socket.sessionId].chatMessages.slice(-100);
-        }
+    if (!socket.sessionId) return;
+    const text = typeof data.text === 'string' ? data.text.slice(0, 2000).trim() : '';
+    if (!text) return;
+    const msg = {
+      id: Date.now(),
+      text: text,
+      from: socket.user.name,
+      userId: socket.user.id,
+      timestamp: new Date().toISOString(),
+    };
+    if (roomState[socket.sessionId]) {
+      roomState[socket.sessionId].chatMessages.push(msg);
+      if (roomState[socket.sessionId].chatMessages.length > 100) {
+        roomState[socket.sessionId].chatMessages = roomState[socket.sessionId].chatMessages.slice(-100);
       }
-      io.to(socket.sessionId).emit('chat-message', msg);
     }
+    io.to(socket.sessionId).emit('chat-message', msg);
   });
 
   socket.on('bookmark-toggled', (data) => {
@@ -1171,39 +1427,67 @@ io.on('connection', (socket) => {
     });
   }
 
+  // Helper: check if leaving user is the host and notify members
+  function handleUserLeaving(sessionId) {
+    if (!sessionId || !activeRooms[sessionId]) return;
+    const session = db.prepare('SELECT created_by FROM sessions WHERE id = ?').get(sessionId);
+    const isHost = session && session.created_by === socket.user.id;
+
+    delete activeRooms[sessionId][socket.id];
+    if (Object.keys(activeRooms[sessionId]).length === 0) {
+      delete activeRooms[sessionId];
+      delete roomState[sessionId];
+    } else {
+      if (isHost) {
+        // Notify all members that the session has ended
+        io.to(sessionId).emit('session-ended', { hostName: socket.user.name });
+      } else {
+        broadcastPresence(sessionId);
+      }
+    }
+    socket.to(sessionId).emit('user-left', { name: socket.user.name });
+  }
+
   // Leave session
   socket.on('leave-session', () => {
     if (socket.sessionId) {
       const sessionId = socket.sessionId;
       socket.leave(sessionId);
-      if (activeRooms[sessionId]) {
-        delete activeRooms[sessionId][socket.id];
-        if (Object.keys(activeRooms[sessionId]).length === 0) {
-          delete activeRooms[sessionId];
-          delete roomState[sessionId];
-        } else {
-          broadcastPresence(sessionId);
-        }
-      }
-      socket.to(sessionId).emit('user-left', { name: socket.user.name });
+      handleUserLeaving(sessionId);
       socket.sessionId = null;
     }
   });
 
   socket.on('disconnect', () => {
     console.log(`Socket disconnected: ${socket.user.name}`);
-    if (socket.sessionId && activeRooms[socket.sessionId]) {
-      const sid = socket.sessionId;
-      delete activeRooms[sid][socket.id];
-      if (Object.keys(activeRooms[sid]).length === 0) {
-        delete activeRooms[sid];
-        delete roomState[sid];
-      } else {
-        broadcastPresence(sid);
-      }
-      socket.to(sid).emit('user-left', { name: socket.user.name });
+    if (socket.sessionId) {
+      handleUserLeaving(socket.sessionId);
     }
   });
+});
+
+// Serve Vite production build in production
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const distPath = join(__dirname, '..', 'dist');
+
+import fs from 'fs';
+if (fs.existsSync(distPath)) {
+  app.use(express.static(distPath));
+  // SPA fallback — serve index.html for any non-API route. API and socket paths
+  // fall through to the 404 below rather than hanging with no response.
+  app.get('/{*path}', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) return next();
+    res.sendFile(join(distPath, 'index.html'));
+  });
+}
+
+// Unmatched API routes get a real status instead of an open connection.
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'Not found.' });
 });
 
 const PORT = process.env.PORT || 3001;

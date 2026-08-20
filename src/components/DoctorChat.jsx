@@ -1,12 +1,29 @@
 import { useState, useRef, useEffect } from 'react';
 import { doctorChat, doctorChatWeb, extractResearchQuery, getFollowUpQuestions } from '../services/api';
 
-const SUGGESTIONS = [
+const ALL_SUGGESTIONS = [
   { text: 'Search papers on GLP-1 agonists for obesity', research: true },
   { text: 'Find research comparing SSRIs vs SNRIs', research: true },
   { text: 'Search studies on BRCA mutations and targeted therapy', research: true },
   { text: 'Find papers on new heart failure management guidelines', research: true },
+  { text: 'What are the latest CAR-T cell therapy trials?', research: true },
+  { text: 'Find studies on mRNA vaccines for cancer', research: true },
+  { text: 'Search papers on gut microbiome and mental health', research: true },
+  { text: 'Research on CRISPR gene editing for sickle cell', research: true },
+  { text: 'Find papers on AI-assisted radiology diagnosis', research: true },
+  { text: 'Search studies on ketamine for treatment-resistant depression', research: true },
+  { text: 'What does the latest data say about statins in elderly?', research: true },
+  { text: 'Find research on long COVID neurological effects', research: true },
+  { text: 'Search papers on checkpoint inhibitors in melanoma', research: true },
+  { text: 'Find studies on continuous glucose monitoring outcomes', research: true },
+  { text: 'Research on psilocybin therapy for PTSD', research: true },
+  { text: 'Search papers on fecal transplant for C. diff', research: true },
 ];
+
+function pickRandom(arr, n) {
+  const shuffled = [...arr].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, n);
+}
 
 const LOADING_MESSAGES = [
   'Scrubbing in... preparing your diagnosis',
@@ -19,13 +36,24 @@ const LOADING_MESSAGES = [
   'Checking vital signs of the evidence...',
 ];
 
-export default function DoctorChat({ onSwitchToResearch }) {
-  const [messages, setMessages] = useState([]);
+export default function DoctorChat({ onSwitchToResearch, doctorMessages: externalMessages, onDoctorMessagesChange }) {
+  const [internalMessages, setInternalMessages] = useState([]);
+  const messages = externalMessages !== undefined ? externalMessages : internalMessages;
+  const setMessages = onDoctorMessagesChange
+    ? (updater) => {
+        if (typeof updater === 'function') {
+          onDoctorMessagesChange((prev) => updater(prev));
+        } else {
+          onDoctorMessagesChange(updater);
+        }
+      }
+    : setInternalMessages;
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [webSearch, setWebSearch] = useState(false);
   const [loadingMsgIndex, setLoadingMsgIndex] = useState(0);
   const [followUpQuestions, setFollowUpQuestions] = useState([]);
+  const [suggestions] = useState(() => pickRandom(ALL_SUGGESTIONS, 4));
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -204,7 +232,7 @@ export default function DoctorChat({ onSwitchToResearch }) {
               Ask me anything about clinical research, treatments, diagnostics, or medical literature.
             </p>
             <div className="dc-suggestions">
-              {SUGGESTIONS.map((s, i) => (
+              {suggestions.map((s, i) => (
                 <button
                   key={i}
                   className="dc-suggestion-card"

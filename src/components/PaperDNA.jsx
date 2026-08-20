@@ -39,12 +39,12 @@ export default function PaperDNA({ paper, evidence, size = 'small' }) {
     const citations = paper.citationCount || 0;
     const titleHash = hashString(paper.title || '');
 
-    // Normalize metrics to 0-1 range
-    const recency = Math.min(1, Math.max(0, (year - 2000) / 26)); // 2000-2026
-    const impact = Math.min(1, citations / 500); // 0-500+ citations
+    // Normalize metrics to 0-1 range with wider spread
+    const recency = Math.min(1, Math.max(0, (year - 2010) / 16)); // 2010-2026 tighter range
+    const impact = Math.min(1, Math.sqrt(citations) / 22); // sqrt scale for better spread
     const evidenceStrength = 1 - ((level - 1) / 5); // Level 1 = 1.0, Level 6 = 0
-    const abstractLength = paper.abstract ? Math.min(1, paper.abstract.length / 2000) : 0.3;
-    const authorCount = Math.min(1, (paper.authors?.length || 1) / 15);
+    const abstractLength = paper.abstract ? Math.min(1, paper.abstract.length / 1500) : 0.1;
+    const authorCount = Math.min(1, (paper.authors?.length || 1) / 10);
 
     // Generate DNA segments — each is a bar with width proportional to the metric
     const segments = [
